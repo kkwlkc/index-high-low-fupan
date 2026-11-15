@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller 构建产物（可再生成，不入库）
+build/
+build_*/
+dist/
+dist_*/
+
+# 运行数据与日志（行情库约 40MB，不入库；日志含本机路径/调试信息）
+*.db
+*.db-wal
+*.db-shm
+复盘_*.log
+basis_debug.log
+复盘_ui.json
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
