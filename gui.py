@@ -234,6 +234,8 @@ class App:
         self._market_width = 0        # 大盘表格总宽度（悬停高亮矩形宽度用）
         self._chart_meta = {}         # {canvas: 折线图坐标变换与序列值}（悬停取值用）
         self._tip_font = None         # 折线图悬停数值面板字体（root 创建后初始化）
+        self.chart_days = CHART_DAYS  # 折线图显示窗口（30/60/90/全部，工具栏可切换）
+        self._block_job = None        # 板块折线图窗口缩放重绘的防抖任务
         self._preload_pending = set(PRELOAD_LABELS)  # 启动预加载未完成的数据源
 
         self._build_toolbar()
@@ -368,6 +370,17 @@ class App:
                                     font=('Microsoft YaHei UI', 10), padx=14, pady=4)
         self.export_btn.pack(side='left', padx=6, pady=10)
 
+        # 图表周期切换（右端）：作用于指数/板块/大盘/两融全部折线图
+        self.chart_days_combo = ttk.Combobox(bar, state='readonly', width=6,
+                                             values=['30日', '60日', '90日', '全部'],
+                                             font=('Microsoft YaHei UI', 9))
+        self.chart_days_combo.current(0)
+        self.chart_days_combo.bind('<<ComboboxSelected>>',
+                                   lambda e: self._on_chart_days_change())
+        self.chart_days_combo.pack(side='right', padx=(2, 12), pady=10)
+        tk.Label(bar, text='图表周期：', bg=COLOR_TOOLBAR, fg=COLOR_TEXT,
+                 font=('Microsoft YaHei UI', 9)).pack(side='right', padx=(6, 2), pady=10)
+
     def _create_tab_view(self, parent):
         """创建一个数据视图：每日统计 Treeview + 个股明细 Treeview + 两张折线图"""
         main_frame = tk.Frame(parent, bg=COLOR_PANEL)
@@ -445,6 +458,18 @@ class App:
         vsb.pack(side='right', fill='y')
         main_tree.bind('<<TreeviewSelect>>', lambda e: self._show_block_names())
 
+        # 中部折线图：OBV 强势数 / 被剔除数趋势。
+        # 板块页此前只有表格 + 名称区，没有趋势视角；固定 180px 高、宽随窗口自适应
+        charts_frame = tk.Frame(parent, bg=COLOR_PANEL, height=180)
+        charts_frame.pack(fill='x', pady=(0, 6))
+        charts_frame.pack_propagate(False)
+        chart_strong = tk.Canvas(charts_frame, bg='#fdfdfd', highlightthickness=0)
+        chart_strong.pack(side='left', fill='both', expand=True, padx=(0, 4))
+        chart_above60 = tk.Canvas(charts_frame, bg='#fdfdfd', highlightthickness=0)
+        chart_above60.pack(side='left', fill='both', expand=True, padx=(4, 0))
+        chart_strong.bind('<Configure>', lambda e: self._schedule_block_redraw())
+        chart_above60.bind('<Configure>', lambda e: self._schedule_block_redraw())
+
         # 下方名称区：两栏并排（OBV强势板块 | OBV强势且60日线上方板块）
         names_frame = tk.Frame(parent, bg=COLOR_PANEL)
         names_frame.pack(fill='both', expand=True, pady=(0, 6))
@@ -478,7 +503,8 @@ class App:
             self._attach_sort(tv)
             self._attach_copy_menu(tv)
 
-        return {'main': main_tree, 'strong': strong_tree, 'above': above_tree}
+        return {'main': main_tree, 'strong': strong_tree, 'above': above_tree,
+                'chart_strong': chart_strong, 'chart_above60': chart_above60}
 
     def _create_margin_view(self, parent):
         """两融视图：沪深京融资余额逐日表 + 两张折线图（合计走势 / 日增减）"""
@@ -1359,6 +1385,7 @@ class App:
                 view['main'].selection_set(children[0])
                 view['main'].see(children[0])
             self._show_block_names()
+            self._redraw_block_charts()
             return
         for day in reversed(result['days']):
             b = day.get('basis')
@@ -1657,7 +1684,7 @@ class App:
         if view['chart_hlb'].winfo_width() < 60 or view['chart_hlb'].winfo_height() < 60:
             self.root.after(80, self._redraw_market_charts)
             return
-        days = list(result['days'])[-CHART_DAYS:]
+        days = list(result['days'])[-self.chart_days:]
         dates = [d['date'] for d in days]
         hlb = [d.get('high_lb', 0) for d in days]
         lb = [d.get('lb', 0) for d in days]
@@ -1665,6 +1692,41 @@ class App:
                         ['#d0342c'], title='最高板（非ST）', floor_zero=True)
         self._draw_line(cl, dates, [lb], ['连板'],
                         ['#1f4e9c'], title='连板家数', floor_zero=True)
+
+    def _on_chart_days_change(self):
+        """图表周期切换：30/60/90 个交易日或全部，作用于四个数据源的全部折线图"""
+        v = self.chart_days_combo.get()
+        self.chart_days = {'30日': 30, '60日': 60, '90日': 90}.get(v, 10 ** 9)
+        self._redraw_charts()
+        self._redraw_block_charts()
+        self._redraw_margin_charts()
+        self._redraw_market_charts()
+
+    def _schedule_block_redraw(self):
+        """板块折线图随窗口缩放重绘（60ms 防抖，同其他图表策略一致）"""
+        if self._block_job is not None:
+            self.root.after_cancel(self._block_job)
+        self._block_job = self.root.after(60, self._redraw_block_charts)
+
+    def _redraw_block_charts(self):
+        """板块 OBV 趋势：剔除后强势数 / 被剔除数（站上60日线）"""
+        result = self.block_result
+        view = self.block_view
+        c1, c2 = view['chart_strong'], view['chart_above60']
+        c1.delete('all')
+        c2.delete('all')
+        self._chart_meta.pop(c1, None)
+        self._chart_meta.pop(c2, None)
+        if result is None or not result['days']:
+            return
+        days = list(result['days'])[-self.chart_days:]
+        dates = [d['date'] for d in days]
+        self._draw_line(c1, dates, [[d['obv_strong'] for d in days]],
+                        ['OBV强势数(剔除后)'], [COLOR_RED],
+                        'OBV强势板块数（剔除60日线上方）', floor_zero=True, area=True)
+        self._draw_line(c2, dates, [[d['obv_strong_above60'] for d in days]],
+                        ['被剔除数'], [COLOR_HIGH],
+                        '被剔除板块数（站上60日线）', floor_zero=True, area=True)
 
     def _redraw_charts(self, event=None):
         """指数子选项卡内两张折线图：创新高/新低数量（红/绿）+ 基差"""
@@ -1681,8 +1743,8 @@ class App:
         self._chart_meta.pop(c2, None)
         if result is None or not result['days']:
             return
-        # 折线图 x 轴按日期正序（左=最早，右=最新）；仅显示最近 CHART_DAYS 个交易日；表格仍保持最新在最上方
-        days = list(result['days'])[-CHART_DAYS:]
+        # 折线图 x 轴按日期正序（左=最早，右=最新）；显示窗口由工具栏 chart_days 决定；表格仍保持最新在最上方
+        days = list(result['days'])[-self.chart_days:]
         dates = [d['date'] for d in days]
         highs = [len(d['high']) for d in days]
         lows = [len(d['low']) for d in days]
@@ -1728,7 +1790,7 @@ class App:
         self._chart_meta.pop(c2, None)
         if result is None or not result['days']:
             return
-        days = list(result['days'])[-CHART_DAYS:]
+        days = list(result['days'])[-self.chart_days:]
         t_dates, totals = [], []
         g_dates, chgs = [], []
         for d in days:
@@ -1744,12 +1806,15 @@ class App:
                         ['#d0342c'], title='融资余额日增减（亿元）', bold_zero=True)
 
     def _draw_line(self, canvas, dates, series_list, labels, colors, title='',
-                   floor_zero=False, bold_zero=False):
+                   floor_zero=False, bold_zero=False, area=False):
         """在 Canvas 上绘制单张折线图（传统 Windows 风格：白底、灰色网格、坐标轴）
 
         floor_zero=True 用于数量类指标（创新高/新低数量、最高板、连板家数）：
         纵轴下界固定为 0。原实现统一在最小值下留 8% 余量，当最小值为 0 时
         会算出负刻度（如 -8），而数量不可能为负。
+
+        area=True 且单序列时，在折线下方填充淡色面积区域（25% 抖动半透明）。
+        所有图统一带末点高亮圆点 + 最新数值标签。
         """
         # 旧悬停元数据先行失效：本次未成功绘制（尺寸不足/无数据）时，
         # 避免悬停提示引用过期的坐标变换与数值
@@ -1824,8 +1889,25 @@ class App:
                 x = ml + pw * i / (n - 1) if n > 1 else ml + pw / 2
                 y = mt + ph - ph * (v - vmin) / (vmax - vmin)
                 pts.extend([x, y])
+            if area and len(series_list) == 1 and len(pts) >= 4:
+                # 面积填充：折线下方到 x 轴的淡色区域；先画面积再画折线，
+                # 25% 抖动半透明，网格线与轴线仍可见
+                poly = [pts[0], h - mb] + pts + [pts[-2], h - mb]
+                canvas.create_polygon(*poly, fill=color, outline='', stipple='gray25')
             if len(pts) >= 4:
                 canvas.create_line(*pts, fill=color, width=1.6, smooth=True)
+        # 末点高亮 + 最新值标签：最新交易日数值一眼可读，不必再对照表格
+        if n >= 2:
+            for series, color in zip(series_list, colors):
+                if not series:
+                    continue
+                v = series[-1]
+                x = ml + pw
+                y = mt + ph - ph * (v - vmin) / (vmax - vmin)
+                canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline='white')
+                ty = y - 12 if y > mt + 22 else y + 12
+                canvas.create_text(x - 8, ty, text=self._fmt_chart_val(v), anchor='e',
+                                   font=('Microsoft YaHei UI', 9, 'bold'), fill=color)
         lx, ly = ml + 6, mt + 4
         for label, color in zip(labels, colors):
             canvas.create_line(lx, ly + 4, lx + 18, ly + 4, fill=color, width=2)

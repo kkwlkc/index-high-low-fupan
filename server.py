@@ -117,7 +117,7 @@ _BASIS_READY_FIX_KEY = 'basis_ready_fix_v1'
 
 # 程序版本：修改代码后须重新打包，并以窗口标题/日志中的版本号核对实际运行程序，
 # 避免"源码已修复、仍在跑旧 exe"的部署错位（曾让基差错误长时间未被修复）。
-APP_VERSION = 'v1.5'
+APP_VERSION = 'v1.5.1'
 
 
 def to_ths(code):
